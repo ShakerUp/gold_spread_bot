@@ -90,23 +90,45 @@ VAR_REST = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/
 async def variational_listener():
     global variational_mid
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.get(VAR_REST) as resp:
-                    data = await resp.json()
+    headers = {
+        "Origin": "https://omni.variational.io"
+    }
 
-                    listings = data.get("listings", [])
+    subscribe_message = {
+        "action": "subscribe",
+        "instruments": [
+            {
+                "underlying": "PAXG",
+                "instrument_type": "perpetual_future",
+                "settlement_asset": "USDC",
+                "funding_interval_s": 3600
+            }
+        ]
+    }
 
-                    for listing in listings:
-                        if listing.get("ticker") == "PAXG":
-                            variational_mid = float(listing["mark_price"])
-                            logger.info(f"Variational REST price: {variational_mid}")
-                            break
+    while True:
+        try:
+            logger.info("Connecting to Variational WS...")
 
-            except Exception as e:
-                logger.error(f"Variational REST error: {e}")
+            async with websockets.connect(
+                "wss://omni-ws-server.prod.ap-northeast-1.variational.io/prices",
+                extra_headers=headers,
+                ping_interval=20
+            ) as ws:
 
+                logger.info("Connected to Variational")
+                await ws.send(json.dumps(subscribe_message))
+                logger.info("Subscribed to PAXG perpetual")
+
+                async for msg in ws:
+                    data = json.loads(msg)
+
+                    if "pricing" in data:
+                        variational_mid = float(data["pricing"]["price"])
+                        logger.info(f"Variational price updated: {variational_mid}")
+
+        except Exception as e:
+            logger.error(f"Variational WS error: {e}")
             await asyncio.sleep(5)
 
 # ================= TELEGRAM =================
