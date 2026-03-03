@@ -4,6 +4,7 @@ import websockets
 import aiohttp
 import os
 import telegram
+import logging
 from dotenv import load_dotenv
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -14,27 +15,42 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Загрузка переменных
+# ================= ЛОГИРОВАНИЕ =================
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+logger = logging.getLogger(__name__)
+
+# ================= ЗАГРУЗКА ENV =================
+
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в .env файле")
 
-# Настройки API
+# ================= НАСТРОЙКИ API =================
+
 PARA_WS = "wss://ws.api.prod.paradex.trade/v1?cancel-on-disconnect=false"
 MEXC_REST = "https://contract.mexc.com/api/v1/contract/ticker?symbol=XAUT_USDT"
+VAR_WS = "wss://omni-ws-server.prod.ap-northeast-1.variational.io/prices"
 
-# Глобальные переменные для цен
+# ================= ГЛОБАЛЬНЫЕ ЦЕНЫ =================
+
 paradex_mid = None
 mexc_mid = None
+variational_mid = None
 
-# ================= БЛОК ДАННЫХ (БИРЖИ) =================
+# ================= DATA LISTENERS =================
 
 async def paradex_listener():
     global paradex_mid
     while True:
         try:
+            logger.info("Connecting to Paradex WS...")
             async with websockets.connect(PARA_WS, ping_interval=20) as ws:
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0",
@@ -51,8 +67,9 @@ async def paradex_listener():
                         if bid and ask:
                             paradex_mid = (float(bid["price"]) + float(ask["price"])) / 2
         except Exception as e:
-            print(f"Paradex reconnecting... {e}")
+            logger.error(f"Paradex error: {e}")
             await asyncio.sleep(5)
+
 
 async def mexc_listener():
     global mexc_mid
@@ -64,79 +81,138 @@ async def mexc_listener():
                     if data.get("success"):
                         mexc_mid = float(data["data"]["lastPrice"])
             except Exception as e:
-                print(f"MEXC error: {e}")
+                logger.error(f"MEXC error: {e}")
             await asyncio.sleep(2)
 
-# ================= БЛОК ТЕЛЕГРАМ БОТА =================
+
+VAR_REST = "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats"
+
+async def variational_listener():
+    global variational_mid
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with session.get(VAR_REST) as resp:
+                    data = await resp.json()
+
+                    listings = data.get("listings", [])
+
+                    for listing in listings:
+                        if listing.get("ticker") == "PAXG":
+                            variational_mid = float(listing["mark_price"])
+                            logger.info(f"Variational REST price: {variational_mid}")
+                            break
+
+            except Exception as e:
+                logger.error(f"Variational REST error: {e}")
+
+            await asyncio.sleep(5)
+
+# ================= TELEGRAM =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("▶ Начать трекинг", callback_data="start_track")]]
-    markup = InlineKeyboardMarkup(keyboard)
+    logger.info("Received /start")
+
+    keyboard = [
+        [InlineKeyboardButton("📊 Paradex vs MEXC", callback_data="start_track_mexc")],
+        [InlineKeyboardButton("📊 Paradex vs Variational", callback_data="start_track_var")]
+    ]
+
     await update.message.reply_text(
-        "📊 Мониторинг цен PAXG/XAUT\n\nНажмите кнопку для запуска обновления (раз в 10 сек):", 
-        reply_markup=markup
+        "📊 Gold Spread Monitor\n\nВыберите режим:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    logger.info(f"Callback received: {query.data}")
+
     await query.answer()
 
-    if query.data == "start_track":
-        if context.user_data.get("tracking"):
-            return
-        
-        context.user_data["tracking"] = True
-        task = asyncio.create_task(update_message_loop(query, context))
-        context.user_data["task"] = task
+    try:
+        if query.data == "start_track_mexc":
+            logger.info("Starting MEXC tracking")
+            context.user_data["tracking"] = True
+            context.user_data["mode"] = "mexc"
+            context.user_data["task"] = asyncio.create_task(update_loop(query, context))
 
-    elif query.data == "stop_track":
-        context.user_data["tracking"] = False
-        if "task" in context.user_data:
-            context.user_data["task"].cancel()
-        
-        await query.edit_message_text(
-            "⛔ Трекинг остановлен",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶ Начать заново", callback_data="start_track")]])
-        )
+        elif query.data == "start_track_var":
+            logger.info("Starting Variational tracking")
+            context.user_data["tracking"] = True
+            context.user_data["mode"] = "variational"
+            context.user_data["task"] = asyncio.create_task(update_loop(query, context))
 
-async def update_message_loop(query, context):
+        elif query.data == "stop_track":
+            logger.info("Stopping tracking")
+            context.user_data["tracking"] = False
+            if "task" in context.user_data:
+                context.user_data["task"].cancel()
+
+            await query.edit_message_text("⛔ Трекинг остановлен")
+
+    except Exception as e:
+        logger.error(f"Button handler error: {e}")
+
+
+async def update_loop(query, context):
     message = query.message
     last_text = ""
 
-    while context.user_data.get("tracking"):
-        if paradex_mid and mexc_mid:
-            diff = paradex_mid - mexc_mid
-            pct = (diff / mexc_mid) * 100
-            text = (
-                f"📊 Gold Spread Monitor\n\n"
-                f"PAXG (Paradex): {paradex_mid:.2f}\n"
-                f"XAUT (MEXC): {mexc_mid:.2f}\n\n"
-                f"Spread: {diff:.2f}$ ({pct:.4f}%)"
-            )
-        else:
-            text = "⏳ Получение данных с бирж..."
+    logger.info("Update loop started")
 
-        if text != last_text:
-            try:
+    while context.user_data.get("tracking"):
+        try:
+            mode = context.user_data.get("mode")
+
+            if mode == "mexc" and paradex_mid and mexc_mid:
+                diff = paradex_mid - mexc_mid
+                pct = (diff / mexc_mid) * 100
+                text = (
+                    f"Paradex: {paradex_mid:.2f}\n"
+                    f"MEXC: {mexc_mid:.2f}\n\n"
+                    f"Spread: {diff:.2f}$ ({pct:.4f}%)"
+                )
+
+            elif mode == "variational" and paradex_mid and variational_mid:
+                diff = paradex_mid - variational_mid
+                pct = (diff / variational_mid) * 100
+                text = (
+                    f"Paradex: {paradex_mid:.2f}\n"
+                    f"Variational: {variational_mid:.2f}\n\n"
+                    f"Spread: {diff:.2f}$ ({pct:.4f}%)"
+                )
+            else:
+                text = "⏳ Waiting for data..."
+
+            if text != last_text:
                 await message.edit_text(
                     text,
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⛔ Остановить", callback_data="stop_track")]])
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⛔ Stop", callback_data="stop_track")]
+                    ])
                 )
                 last_text = text
-            except telegram.error.RetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-            except Exception:
-                pass
-        
-        await asyncio.sleep(10)
 
-# ================= ИНИЦИАЛИЗАЦИЯ =================
+            await asyncio.sleep(10)
+
+        except Exception as e:
+            logger.error(f"Update loop error: {e}")
+            await asyncio.sleep(3)
+
+# ================= INIT =================
 
 async def post_init(application):
+    logger.info("Starting background listeners...")
     asyncio.create_task(paradex_listener())
     asyncio.create_task(mexc_listener())
+    asyncio.create_task(variational_listener())
+
 
 def main():
+    logger.info("Bot starting...")
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -147,8 +223,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    print("--- Бот запущен (без пароля) ---")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
